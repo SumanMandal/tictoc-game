@@ -1,0 +1,91 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: tictac-service
+  namespace: im-test
+  labels:
+    app: tictac-service
+spec:
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: tictac-service
+  template:
+    metadata:
+      annotations:
+        kubernetes.io/change-cause: 'image updated to 1.2.3'
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '9086'
+        prometheus.io/path: '/actuator/prometheus'
+        checksum/config: 7b36eb356bf282734daf5c4b2fc97e030d998d98fff380f73de8ec4a60104c80
+      creationTimestamp:
+      labels:
+        app: tictac-service
+    spec:
+      volumes:
+      - name: log-volume
+        hostPath:
+          path: /applogs/bptm/im-test
+      - name: application-config
+        configMap:
+          name: tictac-service-cm
+          items:
+          - key: application.properties
+            path: application.properties
+      spec:
+      dnsPolicy: Default
+      containers:
+      - name: tictac-service
+        image: registry.docker.nat.bt.com/im-microservices/tictac-service:1.2.3
+        imagePullPolicy:  IfNotPresent
+        ports:
+        - containerPort:  9086
+          protocol: TCP
+        env:
+        - name: JAVA_OPTS
+          value: "-Xms756m -Xmx756m
+          -XX:+UseG1GC -XX:+UseStringDeduplication  -XX:MaxMetaspaceSize=96m "
+        - name: spring.datasource.password
+          valueFrom:
+            secretKeyRef:
+              name: tictac-service-secret
+              key: spring.datasource.password
+
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "1024Mi"
+          requests:
+            cpu: "100m"
+            memory: "1024Mi"
+        volumeMounts:
+        - name: log-volume
+          mountPath: "/log"
+        - name: application-config
+          mountPath: "config"
+          readOnly: true
+        startupProbe:
+          httpGet:
+            path: /actuator/health
+            port:  9086
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 20
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port:  9086
+          periodSeconds: 30
+          failureThreshold: 4
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port:  9086
+          timeoutSeconds: 1
+          periodSeconds: 30
+          failureThreshold: 4

@@ -1,0 +1,130 @@
+#23-08-2021 - updated java11 image, tags to identify java11 specific runners
+
+image: registry.docker.nat.bt.com/im-microservices/maven:3.6.3-amazoncorretto-11
+
+stages:
+  - build
+  - release
+  - deploy
+  
+
+
+job check_image_ver:
+  stage: build
+  tags:
+    - mvn-conf
+  script:
+    - mvn --non-recursive help:evaluate -Dexpression=project.version
+    - TAG=$(mvn --non-recursive help:evaluate -Dexpression=project.version | grep -v '\[.*') 
+    - echo $TAG
+    - SERVICE_NAME=$(mvn --non-recursive help:evaluate -Dexpression=project.artifactId | grep -v '\[.*') 
+    - COMPLETE_IMAGE=$DOCKER_REPO/$DOCKER_PROJECT/$SERVICE_NAME:$TAG
+    - echo $COMPLETE_IMAGE
+    - if [$(docker pull $COMPLETE_IMAGE >> /tmp/dockerpull_output.txt 2> /tmp/dockerpull_output.txt)]; then echo " docker pull completed "  ;fi
+    - cat /tmp/dockerpull_output.txt
+    - OUTPUT=$(cat  /tmp/dockerpull_output.txt)
+    - rm /tmp/dockerpull_output.txt
+    - if echo $OUTPUT | grep -q "Downloaded newer image" || echo $OUTPUT | grep -q "Image is up to date"; then echo "Image already existing. Please update the project version and retry!" ; docker image rm $COMPLETE_IMAGE ; exit 1; else echo "Pipeline seems good to proceed with docker image creation."; fi;
+  only:
+    - merge_requests    
+  except:
+    variables:    
+      - $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =="master"
+
+job build_only:
+  stage: build
+  tags:
+    - mvn-conf
+  script:
+    - if [[ ${SKIP_BUILD} == "y" ]] || [[ ${SKIP_BUILD} == "Y" ]] ; then echo "Project analysis is skipped." ;exit 0 ;else echo "Running the analysis on project." ; fi;
+    - MERGE_REQUEST_ID=$(curl -H "${GITLAB_AUTH_TOKEN}" https://gitlab.agile.nat.bt.com/api/v4/projects/$CI_PROJECT_ID/merge_requests?state=opened | jq ".[]|select(.sha==\"${CI_COMMIT_SHA}\" )|.iid // empty")
+    - if [[ -z "$MERGE_REQUEST_ID" ]];then mvn -Dmvn_user=$MAVEN_USER -Dmvn_pwd=$MAVEN_PASSWORD clean package sonar:sonar -Dsonar.login=$EEADROBT_TOKEN ; else mvn -Dmvn_user=$MAVEN_USER -Dmvn_pwd=$MAVEN_PASSWORD clean package sonar:sonar -Dsonar.login=$EEADROBT_TOKEN -Dsonar.scm.provider=git -Dsonar.pullrequest.branch=$CI_COMMIT_REF_NAME -Dsonar.pullrequest.base=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME -Dsonar.pullrequest.key=$MERGE_REQUEST_ID -Dsonar.verbose=true ;fi;
+    - source target/sonar/report-task.txt
+    - echo $ceTaskUrl
+    - curl $ceTaskUrl >task?id=$ceTaskId
+    - value=$(jq -r '.task.status' task?id=$ceTaskId)
+    - while [[ $value != SUCCESS ]] && [[ $value != FAILED ]] && [[ $value != CANCELED ]]; do sleep 2s; rm task?id=$ceTaskId;  curl $ceTaskUrl >task?id=$ceTaskId; value=$(jq -r '.task.status' task?id=$ceTaskId); done;
+    - cat task?id=$ceTaskId
+    - if echo $value | grep -i "^success$" ; then echo "Sonar analysis completed" ;else echo "Issue with Sonar analysis"; exit 1; fi;
+    - id=$(jq -r '.task.analysisId' task?id=$ceTaskId)
+    - curl --user "$NEXUS_IQ_USERNAME:$NEXUS_IQ_PASSWORD" $MOBIUS_SONAR_API/api/qualitygates/project_status?analysisId=$id -o /tmp/project-status.json 
+    - cat /tmp/project-status.json
+    - status=$(jq -r '.projectStatus.status' /tmp/project-status.json)
+    - rm /tmp/project-status.json
+    - if echo $status | grep -i "^ok$" ; then echo "Sonar analysis result - SUCCESS"; else echo "Sonar analysis result - FAILURE. Please visit $MOBIUS_SONAR_API and resolve the issues."; exit 1; fi;
+  artifacts:
+    paths:
+      - target/product-interactions-service-1.0.${CI_COMMIT_SHORT_SHA}.jar
+     
+
+job build_with_iq_policy:
+  stage: release
+  dependencies:
+    - job build_only
+  image: registry.docker.nat.bt.com/im-microservices/gitlab-nexus-iq-pipeline
+  script:
+    - PATH=${PATH}:${M2_HOME}/bin
+    - mvn --non-recursive help:evaluate -Dexpression=project.version
+    - TAG=$(mvn --non-recursive help:evaluate -Dexpression=project.version | grep -v '\[.*') 
+    - echo $TAG
+    - SERVICE_NAME=$(mvn --non-recursive help:evaluate -Dexpression=project.artifactId | grep -v '\[.*') 
+    - COMPLETE_IMAGE=$DOCKER_REPO/$DOCKER_PROJECT/$SERVICE_NAME:$TAG
+    - SERVICE_NAME=product-interactions-service
+    - echo "TAG NANE- " $TAG
+    - echo "SERVICE NANE- " $SERVICE_NAME
+    - /sonatype/evaluate -i $SERVICE_NAME -r cli.log target/$SERVICE_NAME-$TAG.jar
+    - criticalCount=$(jq -r '.policyEvaluationResult.criticalPolicyViolationCount' cli.log)
+    - severeCount=$(jq -r '.policyEvaluationResult.severePolicyViolationCount' cli.log)
+    - if [[ $criticalCount -gt $criticalThreshold ]] || [[ $severeCount -gt severeThreshold ]]; then echo "Vulnerabilty is more than threshold.Critical vulnerabilities - $criticalCount , Severe vulnerabilities -$severeCount " ; if [[ ${SKIP_IQ_CHECK} == "Y" ]] || [[ ${SKIP_IQ_CHECK} == "y" ]] ;then echo "IQ server policy vulnerability job failure is skipped " ; else echo "Connect to IQ server for vulnerabilities check. " ;  exit 1; fi;else echo "IQ server - SUCCESS." ; fi;
+  artifacts:
+    name: "policy-eval-${CI_PROJECT_NAME}"
+    paths:
+      - cli.log
+      - ${CI_PROJECT_NAME}-policy-eval-report.html
+    expire_in: 1 days
+      
+job build_with_dockerimage:
+  stage: release
+  tags:
+    #- mvn-conf
+    - pr-int-svc
+  script:
+    - if [[ ${SKIP_RELEASE} == "Y" ]] || [[ ${SKIP_RELEASE} == "y" ]]  ; then echo "Image creation is skipped " ;exit 0 ;else echo "Running the release job for Image creation. " ; fi;
+    - mvn --version
+    - echo $(mvn --version)
+    - mvn --non-recursive help:evaluate -Dexpression=project.version
+    - TAG=$(mvn --non-recursive help:evaluate -Dexpression=project.version | grep -v '\[.*') 
+    - echo $TAG
+    - SERVICE_NAME=$(mvn --non-recursive help:evaluate -Dexpression=project.artifactId | grep -v '\[.*') 
+    - COMPLETE_IMAGE=$DOCKER_REPO/$DOCKER_PROJECT/$SERVICE_NAME:$TAG
+    - echo $COMPLETE_IMAGE
+    - if [$(docker pull $COMPLETE_IMAGE >> /tmp/dockerpull_output.txt 2> /tmp/dockerpull_output.txt)]; then echo " docker pull completed "  ;fi
+    - cat /tmp/dockerpull_output.txt
+    - OUTPUT=$(cat  /tmp/dockerpull_output.txt)
+    - rm /tmp/dockerpull_output.txt
+    - if echo $OUTPUT | grep -q "Downloaded newer image" || echo $OUTPUT | grep -q "Image is up to date"; then echo "Image already existing. Please update the project version and retry!" ; docker image rm $COMPLETE_IMAGE ; exit 1; else echo "Pipeline seems good to proceed with docker image creation."; fi;
+    - mvn -Dmvn_user=$MAVEN_USER -Dmvn_pwd=$MAVEN_PASSWORD clean install -Dmaven.test.skip=true -Dpmd.skip=true -Dfindbugs.skip=true -Denforcer.skip=true -Dfmt.skip=true -Dassembly.skipAssembly=true
+  only:
+    - web
+
+
+job deploy_in_cluster:
+  stage: deploy
+  image: registry.docker.nat.bt.com/im-microservices/helm-kubectl
+  script:
+    - CLUSTER_NAME="$(echo -e "${CLUSTER_NAME}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    - ENV_NAME="$(echo -e "${ENV_NAME}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    - if echo $CLUSTER_NAME | grep -i "^DB1$" ; then K8S_API=${K8S_API}; K8S_USER_TOKEN=${K8S_USER_TOKEN}; elif echo $CLUSTER_NAME | grep -i "^DB2$" ; then K8S_API=${K8S_API_Derby2}; K8S_USER_TOKEN=${K8S_USER_TOKEN_Derby2}; elif echo $CLUSTER_NAME | grep -i "^TY1$" ; then K8S_API=${K8S_API_Tynsley1}; K8S_USER_TOKEN=${K8S_USER_TOKEN_Tynsley1}; elif echo $CLUSTER_NAME | grep -i "^TY2$" ; then K8S_API=${K8S_API_Tynsley2}; K8S_USER_TOKEN=${K8S_USER_TOKEN_Tynsley2};elif echo $CLUSTER_NAME | grep -i "^DB3$" ; then K8S_API=${K8S_API_Derby3}; K8S_USER_TOKEN=${K8S_USER_TOKEN_Derby3}; elif echo $CLUSTER_NAME | grep -i "^TY3$" ; then K8S_API=${K8S_API_Tynsley3}; K8S_USER_TOKEN=${K8S_USER_TOKEN_Tynsley3}; else echo "Invalid K8S cluster"; exit1; fi
+    - echo ${K8S_API}
+    - kubectl config set-cluster k8s --server="${K8S_API}"
+    - kubectl config set-cluster k8s --insecure-skip-tls-verify=true
+    - kubectl config set-credentials ${K8S_USER} --token="${K8S_USER_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=${K8S_USER}
+    - kubectl config use-context default
+    - helm repo add  ms-repo ${HELM_REPO_URL}
+    - helm repo update
+    - helm upgrade --install  ${CI_PROJECT_NAME}-${ENV_NAME} -f deployment/${ENV_NAME}.yaml ms-repo/ms-chart
+  only:
+    - web
+  when: manual
+

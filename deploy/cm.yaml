@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tictac-service-cm
+  namespace: im-test
+data:
+  application.properties : |
+
+    logging.level.ROOT=INFO
+
+    management.endpoint.metrics.enabled=true
+
+    management.endpoint.prometheus.enabled=true
+
+    management.health.redis.enabled=false
+
+    management.metrics.export.prometheus.enabled=true
+
+    server.port=8080
+
+
+    spring.main.lazy-initialization=true
